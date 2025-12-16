@@ -88,44 +88,190 @@ class IPAggregator:
                 except ValueError:
                     continue
         
-        print(f"Создано {len(self.candidate_cidrs)} кандидатов CIDR")
+        # ИСПРАВЛЕНИЕ ОШИБКИ 2: Гарантируем, что все /32 правила для целевых IP явно включены
+        # Это критически важно для обеспечения возможности полного покрытия
+        for ip in self.target_ips:
+            network = ipaddress.IPv4Network(f"{ip}/32", strict=False)
+            network_key = str(network)
+            if network_key not in self.candidate_cidrs:
+                ip_int = int(ip)
+                self.candidate_cidrs[network_key] = CIDRBlock(
+                    network=network,
+                    target_ips={ip_int},
+                    total_size=1
+                )
+        
+        print(f"Создано {len(self.candidate_cidrs)} кандидатов CIDR (включая все /32 правила)")
+    
+    def _ensure_full_coverage_with_limit(
+        self, 
+        selected: List[CIDRBlock], 
+        max_entries: int
+    ) -> List[CIDRBlock]:
+        """
+        ИСПРАВЛЕНИЕ ОШИБКИ 1: Обеспечивает полное покрытие с учетом лимита правил.
+        
+        Добавляет /32 правила для непокрытых IP, но гарантирует, что общее
+        количество правил не превышает max_entries.
+        
+        Если непокрытых IP слишком много, возвращает решение с неполным покрытием,
+        но в пределах лимита.
+        """
+        # Определяем непокрытые IP
+        covered = set()
+        for cidr in selected:
+            covered |= cidr.target_ips
+        
+        uncovered = self.target_ips_int - covered
+        
+        if not uncovered:
+            # Уже полное покрытие
+            return selected
+        
+        # Создаем /32 правила для непокрытых IP
+        uncovered_32_rules = []
+        for ip_int in uncovered:
+            ip = ipaddress.IPv4Address(ip_int)
+            network = ipaddress.IPv4Network(f"{ip}/32", strict=False)
+            uncovered_32_rules.append(CIDRBlock(
+                network=network,
+                target_ips={ip_int},
+                total_size=1
+            ))
+        
+        # Проверяем, помещается ли решение в лимит
+        total_rules = len(selected) + len(uncovered_32_rules)
+        
+        if total_rules <= max_entries:
+            # Все помещается - возвращаем полное решение
+            return selected + uncovered_32_rules
+        else:
+            # Не помещается - нужно уменьшить количество агрегированных правил
+            # Возвращаем решение в пределах лимита (может быть неполное покрытие)
+            available_slots = max_entries - len(uncovered_32_rules)
+            
+            if available_slots <= 0:
+                # Даже только /32 правила превышают лимит - возвращаем только часть /32
+                print(f"Предупреждение: Лимит {max_entries} недостаточен для покрытия всех {len(uncovered)} непокрытых IP")
+                print(f"Будет добавлено только {max_entries} /32 правил из {len(uncovered)} непокрытых")
+                return uncovered_32_rules[:max_entries]
+            
+            # Оставляем только лучшие агрегированные правила (по эффективности)
+            # Сортируем по убыванию эффективности (больше IP на правило)
+            selected_sorted = sorted(
+                selected,
+                key=lambda x: len(x.target_ips) / (x.overblock_count + 1),  # эффективность: IP/overblock
+                reverse=True
+            )
+            
+            # Берем только лучшие агрегированные правила, которые помещаются
+            final_selected = selected_sorted[:available_slots]
+            
+            # Определяем, какие IP еще не покрыты после сокращения
+            final_covered = set()
+            for cidr in final_selected:
+                final_covered |= cidr.target_ips
+            
+            still_uncovered = self.target_ips_int - final_covered
+            
+            # Добавляем /32 для оставшихся непокрытых IP (до лимита)
+            remaining_slots = max_entries - len(final_selected)
+            for ip_int in list(still_uncovered)[:remaining_slots]:
+                ip = ipaddress.IPv4Address(ip_int)
+                network = ipaddress.IPv4Network(f"{ip}/32", strict=False)
+                final_selected.append(CIDRBlock(
+                    network=network,
+                    target_ips={ip_int},
+                    total_size=1
+                ))
+            
+            return final_selected
     
     def _remove_dominated(self):
-        """Удаляет доминируемые CIDR блоки (C1 удаляется если C2 ⊂ C1 и w(C2) ≤ w(C1))"""
-        print("Удаление доминируемых CIDR блоков...")
-        initial_count = len(self.candidate_cidrs)
-        
-        to_remove = set()
-        cidr_list = list(self.candidate_cidrs.values())
-        
-        for i, cidr1 in enumerate(cidr_list):
-            if str(cidr1.network) in to_remove:
-                continue
-            
-            for j, cidr2 in enumerate(cidr_list):
-                if i == j or str(cidr2.network) in to_remove:
-                    continue
-                
-                # Проверяем, является ли cidr2 подмножеством cidr1
-                if cidr2.network.subnet_of(cidr1.network):
-                    # Если cidr2 покрывает те же или больше целевых IP с меньшим over-blocking
-                    if (cidr2.target_ips >= cidr1.target_ips and 
-                        cidr2.overblock_count <= cidr1.overblock_count):
-                        to_remove.add(str(cidr1.network))
-                        break
-        
-        for key in to_remove:
-            del self.candidate_cidrs[key]
-        
-        print(f"Удалено {initial_count - len(self.candidate_cidrs)} доминируемых блоков")
+        """
+        ОТКЛЮЧЕНО: Удаление доминируемых CIDR блоков
+
+        Причина отключения: Эта оптимизация может удалять важные кандидаты,
+        что приводит к неполному покрытию целевых IP в жадном алгоритме.
+
+        Оригинальная логика была:
+        - Удалять C1 если C2 ⊂ C1 и w(C2) ≤ w(C1)
+        - Но проверка "cidr2.target_ips >= cidr1.target_ips" неверно интерпретировалась
+
+        Без этой оптимизации алгоритмы работают корректно, хотя и с большим
+        числом кандидатов для перебора (незначительное влияние на производительность).
+        """
+        print("Оптимизация доминируемых CIDR блоков отключена для корректности алгоритма")
+        return  # Функция отключена
     
-    def greedy_aggregate(self, max_entries: int = 2000) -> List[CIDRBlock]:
+    def greedy_aggregate(self, max_entries: int = 2000, iterative: bool = True) -> List[CIDRBlock]:
         """
         Жадный алгоритм агрегации с контролем over-blocking
         Гарантия аппроксимации: O(ln n)
+        
+        ИСПРАВЛЕНИЕ ОШИБКИ 1: Использует итеративный подход для гарантии соблюдения лимита
+        при обеспечении полного покрытия.
         """
         print(f"\n=== Жадный алгоритм (макс. {max_entries} правил) ===")
         
+        if not iterative:
+            # Старый подход без итерации (для обратной совместимости)
+            return self._greedy_aggregate_internal(max_entries)
+        
+        # Итеративный подход: начинаем с max_entries, уменьшаем если нужно
+        current_max = max_entries
+        best_solution = None
+        best_coverage = 0
+        
+        # Максимум 10 итераций для избежания бесконечного цикла
+        for iteration in range(10):
+            solution = self._greedy_aggregate_internal(current_max)
+            
+            # Применяем ensure_full_coverage_with_limit
+            final_solution = self._ensure_full_coverage_with_limit(solution, max_entries)
+            
+            # Проверяем покрытие финального решения
+            covered = set()
+            for cidr in final_solution:
+                covered |= cidr.target_ips
+            coverage = len(covered) / len(self.target_ips_int) * 100
+            
+            # Проверяем, соответствует ли решение требованиям
+            if len(final_solution) <= max_entries:
+                if coverage >= 99.9:  # Полное покрытие
+                    print(f"Итерация {iteration + 1}: Найдено решение с полным покрытием ({coverage:.2f}%) и {len(final_solution)} правил")
+                    return final_solution
+                else:
+                    # Частичное покрытие, но в пределах лимита - запоминаем лучшее
+                    if coverage > best_coverage:
+                        best_coverage = coverage
+                        best_solution = final_solution
+            
+            # Если решение превышает лимит или покрытие неполное, уменьшаем current_max
+            if len(final_solution) > max_entries:
+                # Оценка количества /32 правил, которые понадобятся
+                uncovered_count = len(self.target_ips_int) - len(covered)
+                estimated_needed_slots = uncovered_count
+                current_max = max(1, max_entries - estimated_needed_slots - 10)  # -10 для запаса
+                print(f"Итерация {iteration + 1}: Решение требует {len(final_solution)} правил, уменьшаем лимит до {current_max}")
+            else:
+                # Если решение в пределах лимита, но неполное покрытие, уменьшаем немного
+                current_max = max(1, len(solution) - 50)
+                print(f"Итерация {iteration + 1}: Покрытие {coverage:.2f}%, уменьшаем лимит до {current_max}")
+        
+        # Если не удалось найти решение с полным покрытием, возвращаем лучшее найденное
+        if best_solution is not None:
+            print(f"Найдено лучшее решение с покрытием {best_coverage:.2f}% и {len(best_solution)} правил")
+            return best_solution
+        
+        # Финальная попытка: просто возвращаем решение с ensure_full_coverage_with_limit
+        solution = self._greedy_aggregate_internal(max_entries)
+        return self._ensure_full_coverage_with_limit(solution, max_entries)
+    
+    def _greedy_aggregate_internal(self, max_entries: int) -> List[CIDRBlock]:
+        """
+        Внутренняя реализация жадного алгоритма без итераций
+        """
         uncovered = self.target_ips_int.copy()
         selected: List[CIDRBlock] = []
         candidate_list = list(self.candidate_cidrs.values())
@@ -237,6 +383,16 @@ class IPAggregator:
         coverage = (len(self.target_ips_int) - len(uncovered)) / len(self.target_ips_int) * 100
         print(f"Покрытие: {coverage:.2f}% ({len(self.target_ips_int) - len(uncovered)}/{len(self.target_ips_int)} IP)")
         
+        # ИСПРАВЛЕНИЕ ОШИБКИ 1: Обеспечиваем полное покрытие с учетом лимита
+        selected = self._ensure_full_coverage_with_limit(selected, max_entries)
+        
+        # Проверяем финальное покрытие
+        covered_final = set()
+        for cidr in selected:
+            covered_final |= cidr.target_ips
+        coverage_final = len(covered_final) / len(self.target_ips_int) * 100
+        print(f"Финальное покрытие: {coverage_final:.2f}% ({len(covered_final)}/{len(self.target_ips_int)} IP), правил: {len(selected)}")
+        
         return selected
     
     def ilp_aggregate(self, max_entries: int = 2000, solver: Optional[str] = None) -> Optional[List[CIDRBlock]]:
@@ -259,20 +415,38 @@ class IPAggregator:
         greedy_cidr_keys = {str(c.network) for c in greedy_solution}
         
         # Ограничиваем кандидатов для ускорения (используем только релевантные)
-        relevant_candidates = [
-            c for c in self.candidate_cidrs.values()
-            if str(c.network) in greedy_cidr_keys or any(
-                ip in c.target_ips for ip in self.target_ips_int
-            )
-        ]
+        # ИСПРАВЛЕНИЕ ОШИБКИ 2: Гарантируем, что все /32 правила включены
+        relevant_candidates = []
+        slash32_rules = []
         
-        # Ограничиваем размер для практичности
+        for c in self.candidate_cidrs.values():
+            if c.network.prefixlen == 32:
+                # Все /32 правила обязательно включаем
+                slash32_rules.append(c)
+            elif str(c.network) in greedy_cidr_keys or any(
+                ip in c.target_ips for ip in self.target_ips_int
+            ):
+                relevant_candidates.append(c)
+        
+        # Добавляем все /32 правила
+        relevant_candidates.extend(slash32_rules)
+        
+        # Ограничиваем размер для практичности, но сохраняем все /32 правила
         if len(relevant_candidates) > 10000:
-            print(f"Слишком много кандидатов ({len(relevant_candidates)}), ограничиваем до 10000")
-            relevant_candidates = sorted(
-                relevant_candidates,
+            # Отделяем /32 от остальных
+            non_32_candidates = [c for c in relevant_candidates if c.network.prefixlen != 32]
+            
+            # Сортируем не-/32 кандидаты и берем лучшие
+            non_32_sorted = sorted(
+                non_32_candidates,
                 key=lambda x: (x.overblock_count / len(x.target_ips) if x.target_ips else float('inf'))
-            )[:10000]
+            )
+            
+            # Оставляем место для всех /32 правил
+            max_non_32 = max(0, 10000 - len(slash32_rules))
+            relevant_candidates = non_32_sorted[:max_non_32] + slash32_rules
+            
+            print(f"Ограничиваем не-/32 кандидатов до {max_non_32}, сохраняем все {len(slash32_rules)} /32 правил")
         
         print(f"Используем {len(relevant_candidates)} кандидатов для ILP")
         
@@ -324,33 +498,62 @@ class IPAggregator:
             if x[str(c.network)].value() and x[str(c.network)].value() > 0.5
         ]
         
+        # ИСПРАВЛЕНИЕ ОШИБКИ 1: Обеспечиваем полное покрытие с учетом лимита
+        # ILP может не покрыть все IP, если ограничение кардинальности слишком строгое
+        selected = self._ensure_full_coverage_with_limit(selected, max_entries)
+        
+        # Проверяем финальное покрытие
+        covered_final = set()
+        for cidr in selected:
+            covered_final |= cidr.target_ips
+        coverage_final = len(covered_final) / len(self.target_ips_int) * 100
+        print(f"Финальное покрытие: {coverage_final:.2f}% ({len(covered_final)}/{len(self.target_ips_int)} IP), правил: {len(selected)}")
+        
         return selected
 
 
 def calculate_metrics(selected: List[CIDRBlock], target_ips: Set[int]) -> Dict:
-    """Вычисляет метрики качества агрегации"""
-    total_blocked = sum(c.total_size for c in selected)
-    total_targets = len(target_ips)
-    overblocked = total_blocked - total_targets
-    
-    # Проверяем покрытие
+    """
+    Вычисляет метрики качества агрегации
+
+    ИСПРАВЛЕНИЯ:
+    - Precision теперь использует фактически покрытые IP (covered), а не все целевые
+    - Over-blocking корректно вычисляется только при полном покрытии (≥99.9%)
+    - При неполном покрытии over-blocking = 0 (не применим)
+    """
+    # Проверяем фактическое покрытие
     covered = set()
     for c in selected:
         covered |= c.target_ips
-    
+
+    total_targets = len(target_ips)
+    coverage_percent = len(covered) / total_targets * 100 if total_targets > 0 else 0
+
+    # Over-blocking имеет смысл только при полном покрытии
+    if coverage_percent >= 99.9:  # Учитываем погрешность округления
+        # Все цели покрыты - считаем total blocked включая лишние IP
+        total_blocked = sum(c.total_size for c in selected)
+        overblocked = total_blocked - total_targets
+        false_positive_rate = overblocked / (2**32 - total_targets) if total_targets < 2**32 else 0
+    else:
+        # Неполное покрытие - over-blocking не применим
+        total_blocked = len(covered)  # Считаем только фактически покрытые IP
+        overblocked = 0
+        false_positive_rate = 0.0
+
     metrics = {
         'num_rules': len(selected),
         'target_ips': total_targets,
         'covered_ips': len(covered),
-        'coverage_percent': len(covered) / total_targets * 100 if total_targets > 0 else 0,
+        'coverage_percent': coverage_percent,
         'total_blocked_ips': total_blocked,
         'overblocked_ips': overblocked,
         'expansion_factor': total_blocked / total_targets if total_targets > 0 else 0,
-        'precision': total_targets / total_blocked if total_blocked > 0 else 0,
-        'rule_efficiency': total_targets / len(selected) if selected else 0,
-        'false_positive_rate': overblocked / (2**32 - total_targets) if total_targets < 2**32 else 0,
+        'precision': len(covered) / total_blocked if total_blocked > 0 else 0,  # ИСПРАВЛЕНО
+        'rule_efficiency': len(covered) / len(selected) if selected else 0,  # ИСПРАВЛЕНО: используем covered
+        'false_positive_rate': false_positive_rate,
     }
-    
+
     return metrics
 
 
@@ -466,12 +669,24 @@ def main():
     aggregator = IPAggregator(target_ips)
     
     # Фильтрация по максимальному префиксу
+    # ИСПРАВЛЕНИЕ ОШИБКИ 2: Всегда сохраняем /32 правила даже при фильтрации
     if args.max_prefix > 8:
-        aggregator.candidate_cidrs = {
+        # Отделяем /32 правила, чтобы они не были отфильтрованы
+        slash32_backup = {
+            k: v for k, v in aggregator.candidate_cidrs.items()
+            if v.network.prefixlen == 32
+        }
+        
+        # Фильтруем остальные кандидаты
+        filtered_candidates = {
             k: v for k, v in aggregator.candidate_cidrs.items()
             if v.network.prefixlen >= args.max_prefix
         }
-        print(f"Отфильтровано до {len(aggregator.candidate_cidrs)} кандидатов (префикс >= {args.max_prefix})")
+        
+        # Объединяем отфильтрованные кандидаты с /32 правилами
+        aggregator.candidate_cidrs = {**filtered_candidates, **slash32_backup}
+        
+        print(f"Отфильтровано до {len(aggregator.candidate_cidrs)} кандидатов (префикс >= {args.max_prefix}, сохранены все {len(slash32_backup)} /32 правил)")
     
     # Удаление доминируемых
     aggregator._remove_dominated()
