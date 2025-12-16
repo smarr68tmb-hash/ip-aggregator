@@ -41,6 +41,9 @@ Thumbs.db
 test_output.txt
 *.txt.bak
 
+# Script output files
+missing_ips.txt
+
 # Generated test data (optional - раскомментируйте если не хотите коммитить тестовые данные)
 # test_*.txt
 # *_test.txt
